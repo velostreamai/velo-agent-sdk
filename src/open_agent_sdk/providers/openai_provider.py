@@ -23,6 +23,50 @@ from open_agent_sdk.providers.types import (
 )
 
 
+
+_MAX_TOOL_INPUT_DECODE_DEPTH = 4
+
+
+def _normalise_tool_input(raw: Any) -> dict[str, Any]:
+    """Coerce a provider's tool-call `arguments` into the dict a tool expects.
+
+    A tool-use block's `input` is typed `dict[str, Any]` and was never enforced.
+    Two paths handed a `str` downstream instead, and the first tool method to
+    call `.get()` on it died with
+
+        AttributeError: 'str' object has no attribute 'get'
+
+    killing the run mid-flight, after arbitrary spend, with nothing committed.
+    One dispatch burned 9.9M input tokens that way.
+
+    The two paths differ, and only one is obvious:
+
+    1. The old `except` branch assigned the raw string verbatim when
+       `json.loads` raised — violating the declared type by design.
+    2. **Double-encoded arguments.** The provider JSON-encodes the argument
+       string a second time, so `json.loads` SUCCEEDS and returns a `str`. No
+       exception, and nothing downstream checked the type. This is why "the SDK
+       does not parse arguments" was never an accurate description: it parses,
+       then hands back a string.
+
+    So decode repeatedly while the result is still a string, and fail CLOSED —
+    anything that will not resolve to a dict becomes `{}` rather than reaching a
+    tool. A tool given `{}` does nothing; a tool given a half-decoded string is
+    how a shell command gets misread.
+    """
+    value = raw
+    for _ in range(_MAX_TOOL_INPUT_DECODE_DEPTH):
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            break
+    return value if isinstance(value, dict) else {}
+
+
 class OpenAIProvider:
     """LLM provider for OpenAI Chat Completions API."""
 
@@ -239,10 +283,7 @@ class OpenAIProvider:
         # Tool calls
         for tc in (message.get("tool_calls") or []):
             func = tc.get("function", {})
-            try:
-                input_val = json.loads(func.get("arguments", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                input_val = func.get("arguments", "")
+            input_val = _normalise_tool_input(func.get("arguments"))
 
             content.append({
                 "type": "tool_use",
