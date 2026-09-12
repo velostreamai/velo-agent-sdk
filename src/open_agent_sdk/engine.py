@@ -42,6 +42,12 @@ from open_agent_sdk.utils.retry import with_retry, format_api_error, is_auth_err
 from open_agent_sdk.utils.tokens import estimate_cost
 
 MAX_CONCURRENCY = int(os.environ.get("AGENT_SDK_MAX_TOOL_CONCURRENCY", "10"))
+
+# Bound on a SINGLE tool result fed back into the transcript. The largest observed
+# in a real run was 11,038 characters, and every turn re-sends it. Truncation is
+# always announced in the result itself (see _cap_tool_result) — a cap the model
+# cannot see would have it read a truncated file as a whole file.
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("AGENT_SDK_MAX_TOOL_RESULT_CHARS", "20000"))
 MAX_OUTPUT_RECOVERY_ATTEMPTS = 3
 
 
@@ -139,6 +145,9 @@ class QueryEngine:
         self._total_cost: float = 0.0
         self._turn_count: int = 0
         self._compact_state = create_auto_compact_state()
+        # (tool, input) -> result content, for this run only. Repeated identical
+        # READ-ONLY calls are answered from here instead of re-executing.
+        self._tool_result_cache: dict[str, str] = {}
         self._tool_map: dict[str, BaseTool] = {t.name: t for t in config.tools}
 
     @property
@@ -511,10 +520,36 @@ class QueryEngine:
                     is_error=True,
                 )
 
+        # A repeat of an identical READ-ONLY call is answered from the previous
+        # result rather than re-run. Read-only only: re-running a Write or a Bash
+        # is the caller's intent, and suppressing it would change behaviour.
+        #
+        # The note is NOT cosmetic. A silently-served cache hit looks to the model
+        # exactly like a fresh search that happened to return the same thing, so
+        # it learns nothing and can repeat again; being told it already asked is
+        # the signal that moves it on. Same rule as every other degradation in
+        # this file: if the result is not what the caller literally asked for,
+        # say so in the result the model reads.
+        cache_key = self._tool_cache_key(tool_name, tool_input)
+        if cache_key is not None and tool.is_read_only(tool_input):
+            cached = self._tool_result_cache.get(cache_key)
+            if cached is not None:
+                return ToolResult(
+                    tool_use_id=tool_use_id,
+                    content=(
+                        "(identical call already made this run — previous result below, "
+                        "not re-executed)\n" + cached
+                    ),
+                )
+
         # Execute tool
         try:
             result = await tool.call(tool_input, context)
             result.tool_use_id = tool_use_id
+            result.content = self._cap_tool_result(tool_name, result.content)
+            if cache_key is not None and tool.is_read_only(tool_input) and not result.is_error:
+                if isinstance(result.content, str):
+                    self._tool_result_cache[cache_key] = result.content
             return result
         except Exception as e:
             return ToolResult(
@@ -522,6 +557,47 @@ class QueryEngine:
                 content=f"Tool execution error: {e}",
                 is_error=True,
             )
+
+    @staticmethod
+    def _tool_cache_key(tool_name: str, tool_input: Any) -> str | None:
+        """Stable identity for a tool call, or None if it cannot be keyed.
+
+        sort_keys, because two calls differing only in argument ORDER are the
+        same call and must collide. Unserialisable input returns None — better to
+        re-execute than to key on a repr that is not a value.
+        """
+        try:
+            # NO default=str. It would coerce an unserialisable value to its
+            # repr, and a repr carries an identity, not a value: two distinct
+            # objects whose addresses happen to match key the same, and one call
+            # is answered with another call's result. Caught by the test for
+            # exactly this — CPython reused the address. Let it raise and
+            # re-execute; a wasted call is cheap, a wrong answer is not.
+            return tool_name + "\x00" + json.dumps(tool_input, sort_keys=True)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _cap_tool_result(tool_name: str, content: Any) -> Any:
+        """Bound a single tool result, and SAY when it was bounded.
+
+        The largest single result observed feeding back into context was 11,038
+        characters, with several over 7,000 — every one re-sent on every
+        subsequent turn. micro_compact_messages exists but only acts near the
+        window limit, so ordinary runs carry the full weight.
+
+        A cap the model cannot see is a lie: it would read a truncated file as
+        the whole file. The marker names what was dropped so it can ask for the
+        rest deliberately.
+        """
+        if not isinstance(content, str) or len(content) <= MAX_TOOL_RESULT_CHARS:
+            return content
+        dropped = len(content) - MAX_TOOL_RESULT_CHARS
+        return (
+            content[:MAX_TOOL_RESULT_CHARS]
+            + f"\n\n... [{tool_name} result truncated: {dropped} of {len(content)} "
+            f"characters not shown — narrow the query or request a specific range]"
+        )
 
     def _extract_usage(self, response: Any) -> TokenUsage:
         """Extract token usage from API response."""
