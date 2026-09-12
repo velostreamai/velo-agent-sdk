@@ -1,12 +1,101 @@
-# Open Agent SDK (Python)
+# velo-agent-sdk
 
-[![PyPI version](https://img.shields.io/pypi/v/open-agent-sdk)](https://pypi.org/project/open-agent-sdk/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-brightgreen)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
+> **This is a vendored fork of [codeany-ai/open-agent-sdk-python](https://github.com/codeany-ai/open-agent-sdk-python)**,
+> taken at commit [`ab06815`](https://github.com/codeany-ai/open-agent-sdk-python/commit/ab068156bf7db79cd23a883e8264a12803e23966).
+> Upstream was pushed twice — 2026-04-01 and 04-03 — and abandoned. Full history
+> and the MIT licence are preserved. See [VENDORING.md](./VENDORING.md).
+>
+> **Do not install `open-agent-sdk` from PyPI expecting this code.** That name
+> belongs to a *different, unrelated project*
+> ([slb350/open-agent-sdk](https://github.com/slb350/open-agent-sdk)) that shares
+> both the name and the `0.1.0` version string. This ships `open_agent_sdk/`
+> with `engine.py`, `providers/`, `skills/` and `mcp/`; that one ships
+> `any_agent/` with five files. The upstream PyPI badge was removed from this
+> README for exactly that reason — it pointed at the other project.
 
 Open-source Agent SDK that runs the full agent loop **in-process** — no subprocess or CLI required. Deploy anywhere: cloud, serverless, Docker, CI/CD.
 
 Also available in **TypeScript**: [open-agent-sdk-typescript](https://github.com/codeany-ai/open-agent-sdk-typescript) · **Go**: [open-agent-sdk-go](https://github.com/codeany-ai/open-agent-sdk-go)
+
+## Why this fork exists, and how it measures up
+
+Two questions decided this: *is the runtime worth keeping?* and *is there a
+healthier alternative that does the same job?* Both were answered by running
+them, not by reading their READMEs.
+
+### Measured: this SDK vs `openai-agents`
+
+Same task (locate a function in a large Rust repository by description), same
+model (`deepseek/deepseek-v4-flash-0731` via OpenRouter), same worktree, graded
+against ground truth — an answer counts only if it names **both** the correct
+file and the correct function.
+
+| | this SDK | `openai-agents` 0.22.2 |
+|---|---|---|
+| turns to answer | **3–4** | 9–12 |
+| unknown tool name | error returned to the model | **kills the run** by default |
+| built-in coding tools | `Read`, `Grep`, `Glob`, `Bash`, `Edit`, `Write` | you write them |
+| parallel tool calls | default — `tool start names=Grep,Grep` | off unless configured |
+
+The turn gap is the whole story, and it is **tool semantics, not framework
+quality**. This SDK's `Grep` returns structured, bounded results the model can act
+on; hand-rolled shell wrappers return raw text it must orient itself in. After
+tuning `openai-agents` — `parallel_tool_calls`, `tool_not_found_behavior`,
+tool concurrency, and instructions written for its own tools — it went from
+failing 3 runs in 5 to succeeding in 11 turns. Usable. Still ~3× the turns.
+
+A caution on those numbers: on a 5-round benchmark the task succeeded only
+**40–60% of the time on every runtime tested**. Single runs are worthless here.
+The first one-offs showed 3 turns and looked decisive; they were lucky draws.
+
+### Measured: this SDK before and after vendoring
+
+5 interleaved rounds, abandoned-upstream install vs this repository:
+
+| | upstream @ `ab06815` | this repo @ `558bc6e` |
+|---|---|---|
+| correct | 3/5 | 2/5 |
+| wall (median) | 36 s | 37 s |
+| turns (median) | 8 | 7 |
+| cost (median) | $0.0037 | $0.0035 |
+
+Statistically indistinguishable at n=5 — which is exactly the claim being made:
+**no regression**. It is not evidence of improvement.
+
+### Alternatives considered and rejected
+
+- **DeepSeek Harness (`dsh`) ACP** — a JSON-RPC session protocol, not a runtime.
+  It explicitly rejects *"client filesystem operations"* and *"terminals"*; tools
+  must come from MCP servers you attach. No file or shell tools of its own.
+- **The official `openrouter` SDK** — a Speakeasy-generated HTTP client. No agent
+  loop, no tools, no context state. It sits *below* this layer, not beside it.
+- **OpenHands `software-agent-sdk`** — the closest fit not adopted: ships
+  `grep`, `glob`, `file_editor`, `terminal`, a condenser for long runs, and
+  `litellm_extra_body` (which carries OpenRouter `provider.order`). Health is
+  weaker — 1.1k stars against 496 open issues. Worth revisiting if this fork
+  stops being viable.
+
+### One thing this SDK does that mattered more than any feature
+
+OpenRouter load-balances each request across provider endpoints, and a prefix
+cache is **per-endpoint**. An agent loop re-sends its whole transcript every turn,
+so without pinning it misses the cache on every single one. Measured on identical
+prompts:
+
+```
+without provider.order        with provider.order
+OpenInference  cached=0       Relace  cached=1280
+StreamLake     cached=0       Relace  cached=1280
+Relace         cached=0       Relace  cached=1280
+cost 6.6e-05 … 8.6e-05        cost 2.3e-05   (3.7x cheaper)
+```
+
+That pin lives in the caller, not here — but it is the single largest cost lever
+in the system, and it is worth knowing before benchmarking any agent runtime
+against an OpenAI-compatible gateway.
 
 ## Features
 
