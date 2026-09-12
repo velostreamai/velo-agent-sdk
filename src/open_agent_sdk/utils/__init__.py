@@ -19,6 +19,9 @@ from open_agent_sdk.utils.tokens import (
     get_auto_compact_threshold,
     get_context_window_size,
     get_token_count_from_usage,
+    register_context_windows,
+    registered_context_windows,
+    context_window_is_known,
 )
 from open_agent_sdk.utils.compact import (
     AutoCompactState,
@@ -47,6 +50,9 @@ from open_agent_sdk.utils.context import (
 from open_agent_sdk.utils.file_cache import FileState, FileStateCache, create_file_state_cache
 
 __all__ = [
+    "register_context_windows",
+    "registered_context_windows",
+    "context_window_is_known",
     "create_user_message",
     "create_assistant_message",
     "normalize_messages_for_api",

@@ -75,9 +75,40 @@ class OpenAIProvider:
         *,
         api_key: str = "",
         base_url: str = "",
+        provider_routing: dict[str, Any] | None = None,
+        include_usage: bool = False,
     ):
+        """
+        provider_routing:
+            Gateway routing preferences, sent as the request body's `provider`
+            field. OpenRouter's shape is `{"order": [...], "allow_fallbacks": bool}`.
+
+            This matters more than it looks. A gateway load-balances each request
+            across upstream endpoints, and a prefix cache is PER ENDPOINT. An agent
+            loop re-sends its whole transcript every turn, so without pinning it
+            lands somewhere new each time and misses the cache on EVERY turn.
+            Measured on identical prompts: unpinned, three requests hit three
+            endpoints with 0 cached tokens; pinned, all three hit one endpoint with
+            1280 cached and cost 3.7x less.
+
+            `allow_fallbacks` should normally stay True — a pin that cannot fail
+            over turns a slow or down endpoint into a failed run, which costs far
+            more than a cache miss.
+
+        include_usage:
+            Ask the gateway for real usage accounting (`usage.include`). Without
+            it the response carries no cost and no `prompt_tokens_details`, so
+            `cached_tokens` cannot be read at all — which is why the cache problem
+            above stayed invisible.
+
+        Both default OFF and are omitted from the body entirely when unset: a
+        plain OpenAI endpoint rejects unknown fields, so they must never be sent
+        speculatively.
+        """
         self._api_key = api_key
         self._base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self._provider_routing = provider_routing
+        self._include_usage = include_usage
 
     @property
     def api_type(self) -> ApiType:
@@ -104,6 +135,16 @@ class OpenAIProvider:
     # --------------------------------------------------------------------------
 
     async def _post_chat_completions(self, body: dict[str, Any]) -> dict[str, Any]:
+        # Applied HERE rather than in create_message: this is the one place every
+        # request passes through with a finished body, including any future call
+        # site that builds a body of its own.
+        #
+        # `setdefault`, not assignment — an explicit value from the caller wins.
+        if self._provider_routing is not None:
+            body.setdefault("provider", self._provider_routing)
+        if self._include_usage:
+            body.setdefault("usage", {"include": True})
+
         url = f"{self._base_url}/chat/completions"
         payload = json.dumps(body).encode("utf-8")
 
