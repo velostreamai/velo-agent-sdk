@@ -54,6 +54,9 @@ class QueryEngineConfig:
     append_system_prompt: str = ""
     tools: list[BaseTool] = field(default_factory=list)
     max_turns: int = 10
+    # Whether to tell the model its turn budget in the system prompt. Off by
+    # default: it costs prompt tokens and would duplicate a caller's own guidance.
+    announce_turn_budget: bool = False
     max_budget_usd: float | None = None
     max_tokens: int = 16000
     can_use_tool: Any = None  # CanUseToolFn
@@ -201,7 +204,7 @@ class QueryEngine:
             # Auto-compact if needed
             if should_auto_compact(self._messages, config.model, self._compact_state):
                 result = await compact_conversation(
-                    config.client, config.model, self._messages, self._compact_state
+                    config.provider, config.model, self._messages, self._compact_state
                 )
                 self._messages = result["compacted_messages"]
                 self._compact_state = result["state"]
@@ -328,6 +331,26 @@ class QueryEngine:
             parts.append(config.system_prompt)
         else:
             parts.append("You are a helpful AI assistant with access to tools.")
+
+        # Tell the model its turn budget.
+        #
+        # `max_turns` bounds the loop and the model was never told, so it planned
+        # as though unbounded and was then cut off mid-approach — the turns already
+        # spent producing nothing. Callers worked around this by appending a
+        # sentence to the task, which is every caller re-deriving the same fact the
+        # engine already holds.
+        #
+        # Opt-in: it consumes prompt tokens, and a caller who has written their own
+        # budget guidance should not get two.
+        if config.announce_turn_budget and config.max_turns:
+            parts.append(
+                f"\n# Turn budget\n"
+                f"You have at most {config.max_turns} turns to complete this task. "
+                f"A turn is one model response, including any tool calls it makes. "
+                f"Work to finish within that budget rather than exploring "
+                f"exhaustively; if you cannot finish, say what you established and "
+                f"what remains."
+            )
 
         # Add system context
         try:

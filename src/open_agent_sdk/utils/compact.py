@@ -7,6 +7,8 @@ from typing import Any
 
 import anthropic
 
+from open_agent_sdk.providers.types import CreateMessageParams, LLMProvider
+
 from open_agent_sdk.utils.messages import extract_text_from_content, strip_images_from_messages
 from open_agent_sdk.utils.tokens import estimate_messages_tokens, get_auto_compact_threshold
 
@@ -37,7 +39,7 @@ def should_auto_compact(
 
 
 async def compact_conversation(
-    client: anthropic.AsyncAnthropic,
+    provider: "LLMProvider | anthropic.AsyncAnthropic",
     model: str,
     messages: list[dict[str, Any]],
     state: AutoCompactState,
@@ -46,6 +48,12 @@ async def compact_conversation(
 
     Returns dict with compacted_messages, summary, and updated state.
     """
+    # Back-compat: callers (and the engine before this change) passed a raw
+    # Anthropic client. Wrap it rather than breaking them.
+    if not hasattr(provider, "create_message"):
+        from open_agent_sdk.providers.anthropic_provider import AnthropicProvider
+        provider = AnthropicProvider(client=provider)
+
     try:
         # Strip images before summarizing
         stripped = strip_images_from_messages(messages)
@@ -65,16 +73,45 @@ async def compact_conversation(
             + conversation_text[:50000]
         )
 
-        response = await client.messages.create(
+        # Summarise through the PROVIDER, not a raw Anthropic client.
+        #
+        # This previously called `client.messages.create` — the Anthropic SDK
+        # surface — regardless of which backend was configured. On every
+        # OpenAI-compatible provider (DeepSeek, Qwen, vLLM, Ollama, any gateway),
+        # i.e. the configurations this SDK exists to serve, that call could not
+        # succeed. The bare `except` below then swallowed the failure, counted it,
+        # and after three attempts auto-compaction switched itself off.
+        #
+        # So the feature was imported, advertised, and dead on the majority of
+        # supported deployments, with nothing in the logs to say so.
+        #
+        # `providers/` exists precisely so call sites need not know the backend.
+        response = await provider.create_message(CreateMessageParams(
             model=model,
             max_tokens=2048,
             messages=[{"role": "user", "content": summary_prompt}],
-        )
+        ))
 
+        # Provider responses normalise content to dicts; the old Anthropic path
+        # yielded objects with attributes. Handle both so a caller passing a raw
+        # client still works.
         summary = ""
         for block in response.content:
-            if hasattr(block, "text"):
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    summary += block.get("text") or ""
+            elif hasattr(block, "text"):
                 summary += block.text
+
+        # An empty summary is a FAILURE, not a successful compaction. Accepting it
+        # would replace the conversation with "[Previous conversation summary]"
+        # followed by nothing — silently destroying the context this function
+        # exists to preserve. That is worse than not compacting at all.
+        if not summary.strip():
+            raise RuntimeError(
+                "compaction produced an empty summary; refusing to discard the "
+                "conversation"
+            )
 
         # Build compacted messages
         compacted_messages = [

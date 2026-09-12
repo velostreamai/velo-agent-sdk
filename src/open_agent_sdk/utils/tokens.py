@@ -78,6 +78,53 @@ _CONTEXT_WINDOWS: dict[str, int] = {
 
 DEFAULT_CONTEXT_WINDOW = 200_000
 
+# Models registered at runtime by the caller. Checked BEFORE the built-in table,
+# so a deployment can correct an entry it knows to be wrong.
+#
+# The built-in table holds only Anthropic and OpenAI names. Every model served
+# through an OpenAI-compatible gateway misses both the exact and the prefix
+# lookup and silently takes DEFAULT_CONTEXT_WINDOW — for `deepseek-v4-flash-0731`
+# (1,310,720) that is ~6.5x too small, so auto-compaction trips its threshold with
+# enormous headroom left and starts discarding context the model could have kept.
+#
+# The prefix match cannot rescue this: a vendor-prefixed id like
+# `deepseek/deepseek-v4-flash-0731` shares no prefix with any built-in name.
+_REGISTERED_CONTEXT_WINDOWS: dict[str, int] = {}
+
+
+def register_context_windows(windows: dict[str, int]) -> None:
+    """Declare real context windows for models the built-in table does not know.
+
+        register_context_windows({"deepseek/deepseek-v4-flash-0731": 1_310_720})
+
+    Registered entries take precedence over the built-in table and are matched
+    exactly — no prefix matching, because a caller naming a model id means that
+    model, not everything sharing its first characters.
+    """
+    for name, size in windows.items():
+        if not isinstance(size, int) or size <= 0:
+            raise ValueError(f"context window for {name!r} must be a positive int, got {size!r}")
+    _REGISTERED_CONTEXT_WINDOWS.update(windows)
+
+
+def registered_context_windows() -> dict[str, int]:
+    """What has been registered. Returns a copy; mutating it changes nothing."""
+    return dict(_REGISTERED_CONTEXT_WINDOWS)
+
+
+def context_window_is_known(model: str) -> bool:
+    """Whether the window for `model` is known, or merely defaulted.
+
+    `get_context_window()` cannot express the difference: it returns 200,000 both
+    for a model genuinely that size and for one nobody has ever heard of. A caller
+    that wants to warn — or refuse — needs to be able to tell those apart.
+    """
+    if model in _REGISTERED_CONTEXT_WINDOWS or model in _CONTEXT_WINDOWS:
+        return True
+    if any(model.startswith(k) for k in _CONTEXT_WINDOWS):
+        return True
+    return "opus-4-6" in model
+
 
 def estimate_tokens(text: str) -> int:
     """Estimate token count for text (~4 chars per token, conservative)."""
@@ -133,6 +180,10 @@ def get_token_count_from_usage(usage: TokenUsage) -> int:
 
 def get_context_window_size(model: str) -> int:
     """Get context window size for a model."""
+    # Caller registrations win: a deployment knows its own gateway's models
+    # better than a table baked in at release time.
+    if model in _REGISTERED_CONTEXT_WINDOWS:
+        return _REGISTERED_CONTEXT_WINDOWS[model]
     # Check exact match
     if model in _CONTEXT_WINDOWS:
         return _CONTEXT_WINDOWS[model]
