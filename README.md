@@ -1,5 +1,25 @@
 # velo-agent-sdk
 
+> ## PARKED — not the supported runtime
+>
+> Velostream switched its worker runtime to [`openai-agents`](https://github.com/openai/openai-agents-python)
+> on **2026-09-12** (velostreamai/velostream#2088). This fork is retained as a
+> **rollback only** and is scheduled for deletion on **2026-10-13**.
+>
+> Measured on an 18-turn audit task, 3 rounds each, same model / gateway /
+> provider pin / tools: **correctness 3/3 both**, `openai-agents` **1.73x
+> cheaper** and **4.2x faster** in wall clock. 94–99% of this runtime's wall
+> clock was model wait rather than tool execution, so it was never a tools
+> problem — and its one advantage, fewer tool calls, converted to nothing.
+>
+> **No new work here.** The fixes that mattered (#1–#7) shipped and the RULES
+> travelled to the replacement's tools. Open issues #8 and #9 were closed as
+> parked rather than done; read them for what was learned, not as a backlog.
+>
+> Reopen only if the rollback is exercised in anger and something in it needs
+> fixing.
+
+
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-brightgreen)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
