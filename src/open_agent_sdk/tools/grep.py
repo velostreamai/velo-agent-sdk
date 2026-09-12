@@ -134,6 +134,17 @@ class GrepTool(BaseTool):
 
             cmd.extend(["--", pattern, search_path])
         else:
+            # -E is NOT optional. The tool advertises ripgrep's regex dialect, and
+            # models write it: `a|b`, `null.?pad`, `fn (foo|bar)`. POSIX grep
+            # without -E is BASIC regex, where `|` `?` `+` `(` `)` are LITERAL
+            # characters — so `a|b` searches for the three-character string "a|b",
+            # matches nothing, and exits 0. Not an error. Just empty.
+            #
+            # Measured on a 5-round agent benchmark where ripgrep was absent:
+            # 63% of the model's patterns used those metacharacters and 68% of all
+            # Grep calls came back "No matches found." The model concluded the code
+            # did not exist and spent the run rewording its search.
+            cmd.append("-E")
             if case_insensitive:
                 cmd.append("-i")
             if show_line_numbers and output_mode == "content":
@@ -142,7 +153,7 @@ class GrepTool(BaseTool):
                 cmd.append("-l")
             elif output_mode == "count":
                 cmd.append("-c")
-            cmd.extend([pattern, search_path])
+            cmd.extend(["--", pattern, search_path])
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -161,6 +172,20 @@ class GrepTool(BaseTool):
                 if len(lines) > head_limit:
                     output = "\n".join(lines[:head_limit])
                     output += f"\n\n... (output limited to {head_limit} lines)"
+
+            # Both rg and grep use: 0 = matched, 1 = no match, >=2 = REAL ERROR
+            # (bad regex, unreadable path, bad flag). stderr and the exit code were
+            # both discarded, so every one of those failures rendered as the same
+            # cheerful "No matches found." — a search that never ran was
+            # indistinguishable from a search that found nothing, and the agent
+            # drew a conclusion about the codebase from a tool that had errored.
+            if proc.returncode is not None and proc.returncode >= 2:
+                detail = stderr.decode("utf-8", errors="replace").strip()
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Search failed (exit {proc.returncode}): {detail or 'no detail on stderr'}",
+                    is_error=True,
+                )
 
             if not output.strip():
                 return ToolResult(tool_use_id="", content="No matches found.")
